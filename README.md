@@ -6,4 +6,7 @@ This DNS resolver has a blocklist which where user can add web url to the blockl
 
 This DNS resolver works more or less like this:
 1. User inputs a URL in the Android browser.
-2. The phone send dns message to this resolver, and checks whether the URL is in the blocklist or not. If not, it caches the URL first, then sends the URL to the Cloudflare DNS service (or any other DNS service). Every response from DNS service passed directly to the user.
+2. The phone send dns message to this resolver,
+3. and checks whether the URL is in the blocklist or not.
+4. If not, it caches the URL first, then sends the URL to the Cloudflare DNS service (or any other DNS service).
+5. Every response from DNS service passed directly to the user.
