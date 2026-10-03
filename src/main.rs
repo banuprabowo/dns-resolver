@@ -141,6 +141,16 @@ fn build_new_query(query: &Message, new_id: u16) -> Message {
     queries
 }
 
+fn build_new_response(query: &Message, id: u16) -> Message {
+    let mut resp = Message::new(id, MessageType::Response, query.op_code);
+    resp.metadata.authoritative = true;
+    resp.metadata.response_code = query.response_code;
+    for r in query.answers.iter() {
+        resp.add_answer(r.clone());
+    }
+    resp
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
@@ -160,14 +170,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dns_cache: DnsCache = Arc::new(RwLock::new(HashMap::new()));
     let pending_map: PendingMap = Arc::new(Mutex::new(HashMap::new()));
 
-
     let stats_db: StatsDb = Arc::new(Mutex::new(open_stats_db(&db_path)?));
     let stats_count: i64 = {
         let conn = stats_db.lock().await;
         conn.query_row("SELECT COUNT(*) FROM domain_stats", [], |row| row.get(0))?
     };
     tracing::info!(count = %stats_count, "loaded stats");
-
 
     let app_state = AppState{
         blocklist: blocklist.clone(),
@@ -195,6 +203,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let upstream_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
     upstream_socket.connect(&upstream_dns).await?;
     tracing::info!("DNS resolver listening on {listen_addr}");
+
+    {
+        let upstream_socket = upstream_socket.clone();
+        let pending_map = pending_map.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                let n = match upstream_socket.recv(&mut buf).await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::error!(error = %e, "reader task rec failed");
+                        continue;
+                    }
+                };
+
+                let response = match Message::from_bytes(&buf[..n]) {
+                    Ok(m) => m,
+                    Err(_) => continue
+                };
+                let tx = pending_map.lock().await.remove(&response.id);
+                if let Some(tx) = tx {
+                    let _ = tx.send(buf[..n].to_vec());
+                }
+            }
+        });
+    }
 
     let mut buf = [0u8;512];
     loop {
@@ -296,38 +330,63 @@ async fn handle_query(
         }
     };
 
-
-
     // Forward the exact original query bytes upstream_socket, unchanged, then
     // relay whatever comes back — no need to reparse the reply.
     let new_query = build_new_query(&query, finalize_id);
-    if let Ok(query_bytes) = new_query.to_vec() {
-        upstream_socket.send(&query_bytes).await?;
+    match new_query.to_vec() {
+        Ok(new_query_bytes) => {
+            upstream_socket.send(&new_query_bytes).await?;
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "error sending query");
+        }
     }
 
-    let mut upstream_buf = [0u8; 512];
-    let upstream_resp = upstream_socket.recv(&mut upstream_buf);
-
-    match timeout (Duration::from_secs(upstream_timeout_secs), upstream_resp).await {
+    match timeout (Duration::from_secs(upstream_timeout_secs), rx).await {
         Ok(result) => {
-            let n = result?;
-            if let Ok(q) = Message::from_bytes(&upstream_buf[..n]) {
-                let record = q.clone();
-                // Write DnsCache
-                if let Some(ttl) = record.answers.get(0) {
-                    let expiry = Instant::now() + Duration::from_secs(ttl.ttl.into());
-                    dns_cache.write().await.insert(
-                        (domain, query_type),
-                        CachedEntity {
-                            expiry,
-                            data: record,
-                        }
-                    );
+            let response_bytes = match result {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::error!(error = %e, "error receive data from upstream");
+                    let response_fail = build_servfail(&query);
+                    if let Ok(response_bytes) = response_fail.to_vec() {
+                        socket.send_to(&response_bytes, client_addr).await?;
+                    }
+                    return Ok(())
                 }
+            };
+
+            match Message::from_bytes(&response_bytes) {
+                Ok(response) => { 
+                    let new_response = build_new_response(&response, query.id);
+
+                    // Write DnsCache
+                    if let Some(ttl) = response.answers.get(0) {
+                        let expiry = Instant::now() + Duration::from_secs(ttl.ttl.into());
+                        dns_cache.write().await.insert(
+                            (domain, query_type),
+                            CachedEntity {
+                                expiry,
+                                data: response,
+                            }
+                        );
+                    }
+
+                    if let Ok(new_response_byte) = new_response.to_vec() {
+                        socket.send_to(&new_response_byte, client_addr).await?;
+                        tracing::info!("Query forwarded to upstream");
+                    }
+                }
+                Err(e) => {
+                    let response_fail = build_servfail(&query);
+                    tracing::error!(error = %e, "error receive data from upstream");
+                    if let Ok(response_bytes) = response_fail.to_vec() {
+                        socket.send_to(&response_bytes, client_addr).await?;
+                    }
+                }
+
             }
 
-            socket.send_to(&upstream_buf[..n], client_addr).await?;
-            tracing::info!("Query forwarded to upstream");
         }
         Err(_elapsed) => {
             tracing::warn!(domain = %domain, "Upstream DNS request timed out");
@@ -335,6 +394,7 @@ async fn handle_query(
             if let Ok(response_byte) = response.to_vec() {
                 socket.send_to(&response_byte, client_addr).await?;
             }
+            pending_map.lock().await.remove(&finalize_id);
         }
     }
      Ok(())
