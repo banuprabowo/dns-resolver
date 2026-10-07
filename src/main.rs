@@ -1,4 +1,5 @@
 pub mod blocklist_api;
+mod peer;
 
 use hickory_proto::{
     op::{Message, MessageType, ResponseCode},
@@ -11,6 +12,12 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, Mutex};
 use axum::{Router, routing::get};
+use axum::extract::{Request, State};
+use axum::http::StatusCode;
+use axum::middleware::{from_fn_with_state, Next};
+use axum::response::Response;
+use axum::routing::{delete, post};
+use constant_time_eq::constant_time_eq;
 use dotenvy::dotenv;
 use rusqlite::Connection;
 use tokio::net::UdpSocket;
@@ -18,7 +25,7 @@ use tokio::sync::RwLock;
 use tokio::time::timeout;
 use blocklist_api::{AppState, list_domains, add_domain, remove_domain};
 use crate::blocklist_api::{get_stats, get_suggestion};
-
+use crate::peer::add_peer;
 
 type StatsDb = Arc<Mutex<Connection>>;
 type DnsCache = Arc<RwLock<HashMap<(String, String), CachedEntity>>>;
@@ -30,6 +37,19 @@ struct CachedEntity {
     data: Message,
 }
 
+fn load_peer(db_path: &str) -> rusqlite::Result<HashSet<String>> {
+    let conn = Connection::open(db_path)?;
+
+    conn.execute("CREATE TABLE IF NOT EXISTS peer (ip_address TEXT PRIMARY KEY, device_name TEXT, pub_key TEXT)", () )?;
+
+    let mut stmt = conn.prepare("SELECT ip_address from peer")?;
+    let ip_iter = stmt.query_map([], |row| {row.get::<_, String>(0)})?;
+    let mut ip_set = HashSet::new();
+    for ip in ip_iter {
+        ip_set.insert(ip?);
+    }
+    Ok(ip_set)
+}
 
 fn load_blocklist(db_path: &str) -> rusqlite::Result<HashSet<String>> {
     let conn = Connection::open(db_path)?;
@@ -151,6 +171,31 @@ fn build_new_response(query: &Message, id: u16) -> Message {
     resp
 }
 
+async fn require_admin_key(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next
+) -> Result<Response, StatusCode> {
+    let admin_private_key = &state.admin_private_key;
+    let key = request.headers().get("X-Auth-Key");
+    let incoming_key = key.and_then(|k| k.to_str().ok());
+
+    match incoming_key {
+        Some(key) if constant_time_eq(key.as_ref(), admin_private_key.as_ref()) => {
+            let response = next.run(request).await;
+            Ok(response)
+        }
+        Some(_) =>{
+            tracing::warn!("Unauthorized access attempt with invalid admin key");
+            Err(StatusCode::UNAUTHORIZED)
+        }
+        None => {
+            tracing::warn!("Key does not exist");
+            Err(StatusCode::UNAUTHORIZED)
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
@@ -164,8 +209,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let upstream_dns = env::var("UPSTREAM_DNS").unwrap_or_else(|_| "1.1.1.1:53".to_string());
     let api_listen_addr = env::var("API_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let upstream_timeout_secs: u64 = env::var("UPSTREAM_TIMEOUT_SECS").unwrap_or_else(|_|"15".to_string()).parse()?;
+    let admin_private_key = env::var("ADMIN_PRIVATE_KEY")?;
 
     let blocklist: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(load_blocklist(&db_path)?));
+    let ip_set:Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(load_peer(&db_path)?));
     tracing::info!(count = %blocklist.read().await.len(), "blocklist loaded");
     let dns_cache: DnsCache = Arc::new(RwLock::new(HashMap::new()));
     let pending_map: PendingMap = Arc::new(Mutex::new(HashMap::new()));
@@ -179,15 +226,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app_state = AppState{
         blocklist: blocklist.clone(),
-        db_path: db_path,
+        ip_set,
+        db_path,
         stats_db: stats_db.clone(),
+        admin_private_key,
     };
 
     let api_router = Router::new()
         .route("/domains", get(list_domains).post(add_domain))
-        .route("/domains/{domain}", axum::routing::delete(remove_domain))
+        .route("/domains/{domain}", delete(remove_domain))
         .route("/stats", get(get_stats))
         .route("/suggestions", get(get_suggestion))
+        .route("/peer", post(add_peer))
+        .route_layer(from_fn_with_state(app_state.clone(), require_admin_key))
         .with_state(app_state);
 
     let api_listener = tokio::net::TcpListener::bind(&api_listen_addr).await?;

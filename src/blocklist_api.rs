@@ -21,8 +21,10 @@ pub enum AppError {
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) blocklist: Arc<RwLock<HashSet<String>>>,
+    pub(crate) ip_set: Arc<RwLock<HashSet<String>>>,
     pub(crate) db_path: String,
     pub(crate) stats_db: StatsDb,
+    pub(crate) admin_private_key: String,
 }
 
 #[derive(Serialize)]
