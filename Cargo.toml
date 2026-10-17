@@ -3,6 +3,13 @@ name = "dns-resolver"
 version = "0.1.0"
 edition = "2024"
 
+[profile.release]
+opt-level = "z"
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort" 
+
 [dependencies]
 axum = "0.8.9"
 hickory-proto = "0.26.3"
@@ -16,3 +23,7 @@ serde_json = "1.0.151"
 rand = "0.10.3"
 dotenvy = "0.15.7"
 constant_time_eq = "0.6.1"
+tempfile = "3.27.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"

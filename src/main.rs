@@ -1,39 +1,44 @@
 pub mod blocklist_api;
 mod peer;
 
-use hickory_proto::{
-    op::{Message, MessageType, ResponseCode},
-    serialize::{binary::{
-        BinDecodable, BinEncodable
-    }}
-};
-use std::{collections::{HashSet}, env, net::SocketAddr, sync::Arc};
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
-use tokio::sync::{oneshot, Mutex};
-use axum::{Router, routing::get};
-use axum::extract::{Request, State};
-use axum::http::StatusCode;
-use axum::middleware::{from_fn_with_state, Next};
-use axum::response::Response;
-use axum::routing::{delete, post};
-use constant_time_eq::constant_time_eq;
-use dotenvy::dotenv;
-use rusqlite::Connection;
-use tokio::net::UdpSocket;
-use tokio::sync::RwLock;
-use tokio::time::timeout;
-use blocklist_api::{AppState, list_domains, add_domain, remove_domain};
 use crate::blocklist_api::{get_stats, get_suggestion};
 use crate::peer::add_peer;
+use axum::{
+    Router,
+    extract::{Request, State},
+    http::StatusCode,
+    middleware::{Next, from_fn_with_state},
+    response::Response,
+    routing::{delete, get, post},
+};
+use blocklist_api::{AppState, add_domain, list_domains, remove_domain};
+use constant_time_eq::constant_time_eq;
+use dotenvy::dotenv;
+use hickory_proto::{
+    op::{Message, MessageType, ResponseCode},
+    serialize::binary::{BinDecodable, BinEncodable},
+};
+use rusqlite::Connection;
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::{
+    net::UdpSocket,
+    sync::{Mutex, RwLock, oneshot},
+    time::timeout,
+};
 
 type StatsDb = Arc<Mutex<Connection>>;
 type DnsCache = Arc<RwLock<HashMap<(String, String), CachedEntity>>>;
 type PendingMap = Arc<Mutex<HashMap<u16, oneshot::Sender<Vec<u8>>>>>;
 
-#[derive(Clone,Debug)]
+#[derive(Clone, Debug)]
 struct CachedEntity {
-    expiry : Instant,
+    expiry: Instant,
     data: Message,
 }
 
@@ -41,9 +46,13 @@ fn load_peer(db_path: &str) -> rusqlite::Result<HashSet<String>> {
     let conn = Connection::open(db_path)?;
 
     conn.execute("CREATE TABLE IF NOT EXISTS peer (ip_address TEXT PRIMARY KEY, device_name TEXT, pub_key TEXT)", () )?;
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_peer_pub_key ON peer(pub_key)",
+        (),
+    )?;
 
     let mut stmt = conn.prepare("SELECT ip_address from peer")?;
-    let ip_iter = stmt.query_map([], |row| {row.get::<_, String>(0)})?;
+    let ip_iter = stmt.query_map([], |row| row.get::<_, String>(0))?;
     let mut ip_set = HashSet::new();
     for ip in ip_iter {
         ip_set.insert(ip?);
@@ -55,7 +64,8 @@ fn load_blocklist(db_path: &str) -> rusqlite::Result<HashSet<String>> {
     let conn = Connection::open(db_path)?;
 
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS blocklist (domain TEXT PRIMARY KEY)",(),
+        "CREATE TABLE IF NOT EXISTS blocklist (domain TEXT PRIMARY KEY)",
+        (),
     )?;
 
     // Seed a couple of test entries so there's something to test against
@@ -81,19 +91,24 @@ fn load_blocklist(db_path: &str) -> rusqlite::Result<HashSet<String>> {
     Ok(set)
 }
 
-fn open_stats_db(db_path:&str) -> rusqlite::Result<Connection> {
+fn open_stats_db(db_path: &str) -> rusqlite::Result<Connection> {
     let conn = Connection::open(db_path)?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS domain_stats ( \
         domain TEXT PRIMARY KEY, \
         blocked_count INTEGER NULL DEFAULT 0, \
-        allowed_count INTEGER NULL DEFAULT 0)",(),
+        allowed_count INTEGER NULL DEFAULT 0)",
+        (),
     )?;
     Ok(conn)
 }
 
 async fn record_stat(stats_db: &StatsDb, domain: &str, blocked: bool) {
-    let column =  if blocked {"blocked_count"} else {"allowed_count"};
+    let column = if blocked {
+        "blocked_count"
+    } else {
+        "allowed_count"
+    };
     // Safe to interpolate here specifically: `column` only ever comes from
     // the two hardcoded strings above, never from the query itself — the
     // actual untrusted value (`domain`) still goes through a bound parameter.
@@ -116,7 +131,7 @@ fn is_blocked(domain: &str, blocklist: &HashSet<String>) -> bool {
     // "doubleclick.net" now also catches every subdomain of it.
     for i in 0..labels.len() {
         let candidate = labels[i..].join(".");
-        if blocklist.contains(&candidate){
+        if blocklist.contains(&candidate) {
             return true;
         }
     }
@@ -127,7 +142,7 @@ fn build_nxdomain(query: &Message) -> Message {
     let mut resp = Message::new(query.id, MessageType::Response, query.op_code);
     resp.metadata.authoritative = true;
     resp.metadata.response_code = ResponseCode::NXDomain;
-    if let Some(q) = query.queries.first(){
+    if let Some(q) = query.queries.first() {
         resp.add_query(q.clone());
     }
     resp
@@ -137,14 +152,14 @@ fn build_servfail(query: &Message) -> Message {
     let mut resp = Message::new(query.id, MessageType::Response, query.op_code);
     resp.metadata.authoritative = true;
     resp.metadata.response_code = ResponseCode::ServFail;
-    if let Some(q) = query.queries.first(){
+    if let Some(q) = query.queries.first() {
         resp.add_query(q.clone());
     }
     resp
 }
 
 fn build_cached_response(cached: Message, cache_id: u16) -> Message {
-   let mut resp = Message::new(cache_id, MessageType::Response, cached.op_code);
+    let mut resp = Message::new(cache_id, MessageType::Response, cached.op_code);
     resp.metadata.authoritative = true;
     resp.metadata.response_code = cached.response_code;
     for answer in cached.answers {
@@ -157,7 +172,7 @@ fn build_new_query(query: &Message, new_id: u16) -> Message {
     let mut queries = Message::new(new_id, MessageType::Query, query.op_code);
     for q in query.queries.iter() {
         queries.add_query(q.clone());
-    };
+    }
     queries
 }
 
@@ -174,7 +189,7 @@ fn build_new_response(query: &Message, id: u16) -> Message {
 async fn require_admin_key(
     State(state): State<AppState>,
     request: Request,
-    next: Next
+    next: Next,
 ) -> Result<Response, StatusCode> {
     let admin_private_key = &state.admin_private_key;
     let key = request.headers().get("X-Auth-Key");
@@ -185,7 +200,7 @@ async fn require_admin_key(
             let response = next.run(request).await;
             Ok(response)
         }
-        Some(_) =>{
+        Some(_) => {
             tracing::warn!("Unauthorized access attempt with invalid admin key");
             Err(StatusCode::UNAUTHORIZED)
         }
@@ -207,12 +222,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_path = env::var("DB_PATH").unwrap_or_else(|_| "blocklist.db".to_string());
     let listen_addr = env::var("LISTEN_ADDR").unwrap_or_else(|_| "10.13.13.1:53".to_string());
     let upstream_dns = env::var("UPSTREAM_DNS").unwrap_or_else(|_| "1.1.1.1:53".to_string());
-    let api_listen_addr = env::var("API_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
-    let upstream_timeout_secs: u64 = env::var("UPSTREAM_TIMEOUT_SECS").unwrap_or_else(|_|"15".to_string()).parse()?;
+    let api_listen_addr =
+        env::var("API_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    let upstream_timeout_secs: u64 = env::var("UPSTREAM_TIMEOUT_SECS")
+        .unwrap_or_else(|_| "15".to_string())
+        .parse()?;
     let admin_private_key = env::var("ADMIN_PRIVATE_KEY")?;
+    let server_pub_key = env::var("SERVER_PUBLIC_KEY")?;
+    let server_endpoint = env::var("SERVER_ENDPOINT")?;
 
     let blocklist: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(load_blocklist(&db_path)?));
-    let ip_set:Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(load_peer(&db_path)?));
+    let ip_set: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(load_peer(&db_path)?));
     tracing::info!(count = %blocklist.read().await.len(), "blocklist loaded");
     let dns_cache: DnsCache = Arc::new(RwLock::new(HashMap::new()));
     let pending_map: PendingMap = Arc::new(Mutex::new(HashMap::new()));
@@ -224,12 +244,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     tracing::info!(count = %stats_count, "loaded stats");
 
-    let app_state = AppState{
+    let app_state = AppState {
         blocklist: blocklist.clone(),
         ip_set,
         db_path,
         stats_db: stats_db.clone(),
         admin_private_key,
+        server_pub_key,
+        server_endpoint,
     };
 
     let api_router = Router::new()
@@ -271,7 +293,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let response = match Message::from_bytes(&buf[..n]) {
                     Ok(m) => m,
-                    Err(_) => continue
+                    Err(_) => continue,
                 };
                 let tx = pending_map.lock().await.remove(&response.id);
                 if let Some(tx) = tx {
@@ -281,7 +303,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    let mut buf = [0u8;512];
+    let mut buf = [0u8; 512];
     loop {
         let (len, client_addr) = socket.recv_from(&mut buf).await?;
         let upstream_socket = upstream_socket.clone();
@@ -296,13 +318,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Handle each query on its own task so one slow upstream_socket lookup
         // doesn't stall queries from other devices.
         tokio::spawn(async move {
-            if let Err(e) = handle_query(socket,upstream_socket, query_bytes,client_addr, blocklist, stats_db, dns_cache, pending_map, upstream_timeout_secs).await {
+            if let Err(e) = handle_query(
+                socket,
+                upstream_socket,
+                query_bytes,
+                client_addr,
+                blocklist,
+                stats_db,
+                dns_cache,
+                pending_map,
+                upstream_timeout_secs,
+            )
+            .await
+            {
                 tracing::error!(error = %e, "error handling query");
             }
         });
     }
 }
-
 
 async fn handle_query(
     socket: Arc<UdpSocket>,
@@ -317,14 +350,22 @@ async fn handle_query(
 ) -> std::io::Result<()> {
     let query = match Message::from_bytes(&query_bytes) {
         Ok(m) => m,
-        Err(_) => return Ok(()) // not a valid DNS Message - silently drop
+        Err(_) => return Ok(()), // not a valid DNS Message - silently drop
     };
 
     let (tx, rx) = oneshot::channel();
 
     // Take domain name from query
-    let domain = query.queries.first().map(|q| q.name().to_string()).unwrap_or_default();
-    let query_type = query.queries.first().map(|q|q.query_type.to_string()).unwrap_or_default();
+    let domain = query
+        .queries
+        .first()
+        .map(|q| q.name().to_string())
+        .unwrap_or_default();
+    let query_type = query
+        .queries
+        .first()
+        .map(|q| q.query_type.to_string())
+        .unwrap_or_default();
 
     // Check if domain in blocklist
     let blocked = {
@@ -341,7 +382,7 @@ async fn handle_query(
         if let Ok(response_byte) = response.to_vec() {
             socket.send_to(&response_byte, client_addr).await?;
         }
-        return Ok(())
+        return Ok(());
     }
 
     tracing::info!(domain = %domain, "allowed");
@@ -351,18 +392,21 @@ async fn handle_query(
 
     let cache_hit = {
         let cache = dns_cache.read().await;
-        cache.get(&keys).filter(|c| c.expiry > Instant::now()).cloned()
+        cache
+            .get(&keys)
+            .filter(|c| c.expiry > Instant::now())
+            .cloned()
     };
 
     if let Some(cache) = cache_hit {
-        let response = build_cached_response(cache.data,query.id);
+        let response = build_cached_response(cache.data, query.id);
         if let Ok(response_byte) = response.to_vec() {
             socket.send_to(&response_byte, client_addr).await?;
         }
-        return Ok(())
+        return Ok(());
     }
 
-    let mut new_id= rand::random::<u16>();
+    let mut new_id = rand::random::<u16>();
     let mut lock = pending_map.lock().await;
 
     let finalize_id = {
@@ -393,7 +437,7 @@ async fn handle_query(
         }
     }
 
-    match timeout (Duration::from_secs(upstream_timeout_secs), rx).await {
+    match timeout(Duration::from_secs(upstream_timeout_secs), rx).await {
         Ok(result) => {
             let response_bytes = match result {
                 Ok(bytes) => bytes,
@@ -403,23 +447,23 @@ async fn handle_query(
                     if let Ok(response_bytes) = response_fail.to_vec() {
                         socket.send_to(&response_bytes, client_addr).await?;
                     }
-                    return Ok(())
+                    return Ok(());
                 }
             };
 
             match Message::from_bytes(&response_bytes) {
-                Ok(response) => { 
+                Ok(response) => {
                     let new_response = build_new_response(&response, query.id);
 
                     // Write DnsCache
-                    if let Some(ttl) = response.answers.get(0) {
+                    if let Some(ttl) = response.answers.first() {
                         let expiry = Instant::now() + Duration::from_secs(ttl.ttl.into());
                         dns_cache.write().await.insert(
                             (domain, query_type),
                             CachedEntity {
                                 expiry,
                                 data: response,
-                            }
+                            },
                         );
                     }
 
@@ -435,9 +479,7 @@ async fn handle_query(
                         socket.send_to(&response_bytes, client_addr).await?;
                     }
                 }
-
             }
-
         }
         Err(_elapsed) => {
             tracing::warn!(domain = %domain, "Upstream DNS request timed out");
@@ -448,5 +490,5 @@ async fn handle_query(
             pending_map.lock().await.remove(&finalize_id);
         }
     }
-     Ok(())
+    Ok(())
 }

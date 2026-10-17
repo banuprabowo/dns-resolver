@@ -1,21 +1,31 @@
-use std::collections::HashSet;
-use std::sync::Arc;
+use crate::StatsDb;
+use axum::response::{IntoResponse, Response};
 use axum::{
+    Json,
     extract::{Path as AxumPath, State},
     http::StatusCode,
-    Json,
 };
-use axum::response::{IntoResponse, Response};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashSet;
+use std::sync::Arc;
 use tokio::sync::RwLock;
-use crate::StatsDb;
 
 #[derive(thiserror::Error, Debug)]
 pub enum AppError {
     #[error("Database error:{0}")]
     DatabaseError(#[from] rusqlite::Error),
+    #[error("No free IP address available")]
+    NoFreeIpAddress,
+    #[error("Wireguard error:{0}")]
+    WireguardError(String),
+    #[error("Invalid public key")]
+    InvalidPublicKey,
+    #[error("Duplicate public key")]
+    DuplicatePublicKey,
+    #[error("Device name empty")]
+    InvalidDeviceName,
 }
 
 #[derive(Clone)]
@@ -25,6 +35,8 @@ pub(crate) struct AppState {
     pub(crate) db_path: String,
     pub(crate) stats_db: StatsDb,
     pub(crate) admin_private_key: String,
+    pub(crate) server_pub_key: String,
+    pub(crate) server_endpoint: String,
 }
 
 #[derive(Serialize)]
@@ -40,10 +52,9 @@ pub(crate) struct AddDomainRequest {
 }
 
 #[derive(Serialize)]
-pub(crate) struct DomainList{
+pub(crate) struct DomainList {
     domains: Vec<String>,
 }
-
 
 #[derive(Serialize)]
 pub(crate) struct SuggestedDomain {
@@ -51,14 +62,30 @@ pub(crate) struct SuggestedDomain {
     allowed_count: i64,
 }
 
-const SUGGESTION_MIN_COUNT:i64 = 3;
+const SUGGESTION_MIN_COUNT: i64 = 3;
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        tracing::error!(error = ?self, "Database error occurred");
         let (status, response) = match self {
             AppError::DatabaseError(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Database error"),
+            AppError::NoFreeIpAddress => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "No free IP address available",
+            ),
+            AppError::WireguardError(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not register peer with wireguard",
+            ),
+            AppError::InvalidPublicKey => (StatusCode::BAD_REQUEST, "Invalid public key"),
+            AppError::DuplicatePublicKey => (StatusCode::CONFLICT, "Duplicate public key"),
+            AppError::InvalidDeviceName => (StatusCode::BAD_REQUEST, "Device name invalid"),
         };
+
+        if status.is_server_error() {
+            tracing::error!(error=?self, "request failed");
+        }else {
+            tracing::error!(error=?self, "request rejected");
+        }
 
         let body = Json(json!({
             "error": response,
@@ -69,20 +96,24 @@ impl IntoResponse for AppError {
     }
 }
 
-pub(crate) async fn get_suggestion(State(state): State<AppState>) -> Result<Json<Vec<SuggestedDomain>>, AppError> {
+pub(crate) async fn get_suggestion(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<SuggestedDomain>>, AppError> {
     let conn = state.stats_db.lock().await;
     let mut stmt = conn
         .prepare(
             "SELECT domain, allowed_count FROM domain_stats WHERE domain NOT IN (SELECT domain from blocklist) AND allowed_count >= ?1 ORDER BY allowed_count DESC",
         )?;
-    let rows = stmt
-        .query_map([SUGGESTION_MIN_COUNT], |row| {
-            Ok(SuggestedDomain {domain: row.get(0)?, allowed_count: row.get(1)?})
-        })?;
+    let rows = stmt.query_map([SUGGESTION_MIN_COUNT], |row| {
+        Ok(SuggestedDomain {
+            domain: row.get(0)?,
+            allowed_count: row.get(1)?,
+        })
+    })?;
 
     //Option 1
     match rows.collect() {
-        Ok(suggestion)=> Ok(Json(suggestion)),
+        Ok(suggestion) => Ok(Json(suggestion)),
         Err(e) => Err(AppError::DatabaseError(e)),
     }
 
@@ -90,9 +121,13 @@ pub(crate) async fn get_suggestion(State(state): State<AppState>) -> Result<Json
     // let suggestion = rows.collect::<Result<Vec<_>, _>>()?;
     // Ok(Json(suggestion))
 }
-pub(crate) async fn get_stats(State(state): State<AppState>) -> Result<Json<Vec<DomainStat>>, AppError> {
+pub(crate) async fn get_stats(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<DomainStat>>, AppError> {
     let conn = state.stats_db.lock().await;
-    let mut stmt = conn.prepare("SELECT domain, blocked_count, allowed_count FROM domain_stats ORDER by blocked_count DESC")?;
+    let mut stmt = conn.prepare(
+        "SELECT domain, blocked_count, allowed_count FROM domain_stats ORDER by blocked_count DESC",
+    )?;
     let rows = stmt.query_map((), |row| {
         Ok(DomainStat {
             domain: row.get(0)?,
@@ -110,12 +145,13 @@ pub(crate) async fn get_stats(State(state): State<AppState>) -> Result<Json<Vec<
     //Option 2
     // let stats = rows.collect::Result<Vec<_>,_>>()?;
     // Ok(Json(stats))
-
 }
 
-pub(crate) async fn list_domains(State(state): State<AppState>) -> Json<DomainList>{
+pub(crate) async fn list_domains(State(state): State<AppState>) -> Json<DomainList> {
     let list = state.blocklist.read().await;
-    Json(DomainList{domains: list.iter().cloned().collect()})
+    Json(DomainList {
+        domains: list.iter().cloned().collect(),
+    })
 }
 
 pub(crate) async fn add_domain(
@@ -124,14 +160,17 @@ pub(crate) async fn add_domain(
 ) -> Result<StatusCode, AppError> {
     let domain = payload.domain.trim().to_lowercase();
     let conn = Connection::open(&state.db_path)?;
-    let result = conn.execute("INSERT OR IGNORE INTO blocklist (domain) VALUES (?1)", [&domain])?;
+    let result = conn.execute(
+        "INSERT OR IGNORE INTO blocklist (domain) VALUES (?1)",
+        [&domain],
+    )?;
 
     match result {
         0 => Ok(StatusCode::OK),
         _ => {
             state.blocklist.write().await.insert(domain);
             Ok(StatusCode::CREATED)
-        },
+        }
     }
 }
 
@@ -147,6 +186,6 @@ pub(crate) async fn remove_domain(
         _ => {
             state.blocklist.write().await.remove(&domain);
             Ok(StatusCode::NO_CONTENT)
-        },
+        }
     }
 }
